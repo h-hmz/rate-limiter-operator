@@ -36,7 +36,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	webhookv1 "github.com/h-hmz/rate-limiter-operator/internal/webhook/v1"
+	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
+	rlcontroller "github.com/h-hmz/rate-limiter-operator/internal/controller/rl"
+	webhookv1 "github.com/h-hmz/rate-limiter-operator/internal/webhook/core/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -49,6 +51,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(rlv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -184,6 +187,13 @@ func main() {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "Pod")
 			os.Exit(1)
 		}
+	}
+	if err := (&rlcontroller.RateLimitPolicyReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "rl-ratelimitpolicy")
+		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 

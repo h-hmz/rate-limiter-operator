@@ -6,6 +6,7 @@ cliVersion: 4.15.0
 domain: hhmz.dev
 layout:
 - go.kubebuilder.io/v4
+multigroup: true
 projectName: rate-limiter-operator
 repo: github.com/h-hmz/rate-limiter-operator
 resources:
@@ -17,4 +18,13 @@ resources:
   webhooks:
     defaulting: true
     webhookVersion: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: hhmz.dev
+  group: rl
+  kind: RateLimitPolicy
+  path: github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1
+  version: v1alpha1
 version: "3"
