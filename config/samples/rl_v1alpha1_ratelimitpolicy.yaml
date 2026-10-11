@@ -1,0 +1,13 @@
+apiVersion: rl.hhmz.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: rate-limiter-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: ratelimitpolicy-sample
+spec:
+  algorithm: tokenbucket
+  store: memory
+  tokenBucket:
+    requests: 2
+    burst: 2

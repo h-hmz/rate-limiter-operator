@@ -1,0 +1,29 @@
+# This rule is not used by the project rate-limiter-operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to rl.hhmz.dev resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: rate-limiter-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: rl-ratelimitpolicy-viewer-role
+rules:
+- apiGroups:
+  - rl.hhmz.dev
+  resources:
+  - ratelimitpolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rl.hhmz.dev
+  resources:
+  - ratelimitpolicies/status
+  verbs:
+  - get
