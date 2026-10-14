@@ -113,6 +113,7 @@ type RateLimitPolicySpec struct {
 	// redis shares one set of buckets across every pod using this policy, and makes the operator provision a Redis Deployment, Service and Secret owned by this object.
 	//
 	// +required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="store is immutable"
 	Store Store `json:"store"`
 
 	// key selects what requests are bucketed by. ip uses the client address read from the

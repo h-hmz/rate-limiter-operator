@@ -117,6 +117,9 @@ spec:
                 - memory
                 - redis
                 type: string
+                x-kubernetes-validations:
+                - message: store is immutable
+                  rule: self == oldSelf
               tokenBucket:
                 description: |-
                   tokenBucket configures the tokenbucket algorithm.

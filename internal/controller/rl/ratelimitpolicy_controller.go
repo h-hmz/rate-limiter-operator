@@ -18,13 +18,56 @@ package rl
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"maps"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
+)
+
+const (
+	// ManagedByLabelKey and ManagedByLabelValue mark every object this operator provisions.
+	ManagedByLabelKey   = "app.kubernetes.io/managed-by"
+	ManagedByLabelValue = "rate-limiter-operator"
+
+	redisImage    = "redis:8.2.10-alpine3.22"
+	redisReplicas = 1
+
+	// redisPasswordKey is the Secret key holding the generated password.
+	redisPasswordKey = "redis-password"
+
+	// redisPasswordHashAnnotation carries a hash of the current password on the Redis pod
+	// template, so rotating the Secret rolls the Deployment.
+	redisPasswordHashAnnotation = "rl.hhmz.dev/redis-password-hash"
+
+	// ConditionReady is the single condition type a policy carries.
+	ConditionReady = "Ready"
+
+	// ReasonNoProvisioningRequired is a memory-store policy, which has nothing to build.
+	ReasonNoProvisioningRequired = "NoProvisioningRequired"
+	// ReasonRedisAvailable means the Redis Deployment reports an available replica.
+	ReasonRedisAvailable = "RedisAvailable"
+	// ReasonRedisUnavailable means the Redis Deployment reports no, not yet or no more available replica.
+	ReasonRedisUnavailable = "RedisUnavailable"
+	// ReasonProvisionFailed means this pass could not converge the children at all.
+	ReasonProvisionFailed = "ProvisionFailed"
 )
 
 // RateLimitPolicyReconciler reconciles a RateLimitPolicy object
@@ -36,28 +79,297 @@ type RateLimitPolicyReconciler struct {
 // +kubebuilder:rbac:groups=rl.hhmz.dev,resources=ratelimitpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rl.hhmz.dev,resources=ratelimitpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rl.hhmz.dev,resources=ratelimitpolicies/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the RateLimitPolicy object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
 func (r *RateLimitPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	var rlp rlv1alpha1.RateLimitPolicy
 
-	// TODO(user): your logic here
+	if err := r.Get(ctx, req.NamespacedName, &rlp); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-	return ctrl.Result{}, nil
+	provisionErr := r.provision(ctx, &rlp)
+
+	if err := r.updateStatus(ctx, &rlp, provisionErr); err != nil {
+		return ctrl.Result{}, errors.Join(provisionErr, err)
+	}
+
+	// Returning the provisioning error requeues with backoff.
+	return ctrl.Result{}, provisionErr
+}
+
+// provision brings the policy's children into line with its spec.
+// A memory-store policy has no children, so this is a no-op for it.
+func (r *RateLimitPolicyReconciler) provision(ctx context.Context, p *rlv1alpha1.RateLimitPolicy) error {
+	if p.Spec.Store != rlv1alpha1.StoreRedis {
+		return nil
+	}
+	passwordHash, err := r.reconcileRedisSecret(ctx, p)
+	if err != nil {
+		return err
+	}
+	if err := r.reconcileRedisService(ctx, p); err != nil {
+		return err
+	}
+	return r.reconcileRedisDeployment(ctx, p, passwordHash)
+}
+
+// reconcileRedisSecret creates the Secret holding the Redis password, and returns a hash
+// of the password for the Deployment to carry on its pod template.
+//
+// Data is immutable, therefore rotating the password means deleting the Secret
+// and letting the next reconcile mint a new one.
+func (r *RateLimitPolicyReconciler) reconcileRedisSecret(ctx context.Context, p *rlv1alpha1.RateLimitPolicy) (string, error) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: redisChildName(p), Namespace: p.Namespace},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if len(secret.Data[redisPasswordKey]) == 0 {
+			// 26 characters of RFC 4648 base32, at least 128 bits of entropy.
+			secret.Data = map[string][]byte{redisPasswordKey: []byte(rand.Text())}
+		}
+
+		secret.Type = corev1.SecretTypeOpaque
+		secret.Immutable = new(true)
+
+		// Merged, so labels added elsewhere are left in place.
+		secret.Labels = mergeLabels(secret.Labels, redisChildLabels(p))
+
+		return controllerutil.SetControllerReference(p, secret, r.Scheme)
+	})
+	if err != nil {
+		return "", fmt.Errorf("reconciling redis secret: %w", err)
+	}
+
+	logf.FromContext(ctx).V(1).Info("reconciled secret", "name", secret.Name, "op", op)
+
+	sum := sha256.Sum256(secret.Data[redisPasswordKey])
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// reconcileRedisService reconciles the ClusterIP Service in front of the Redis pod.
+func (r *RateLimitPolicyReconciler) reconcileRedisService(ctx context.Context, p *rlv1alpha1.RateLimitPolicy) error {
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      redisChildName(p),
+			Namespace: p.Namespace,
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+
+		svc.Spec.Selector = redisChildLabels(p)
+		svc.Labels = mergeLabels(svc.Labels, redisChildLabels(p))
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+
+		svc.Spec.Ports = []corev1.ServicePort{
+			{
+				Name:       "redis",
+				Port:       6379,
+				TargetPort: intstr.FromString("redis"),
+				Protocol:   corev1.ProtocolTCP,
+			},
+		}
+
+		return controllerutil.SetControllerReference(
+			p,
+			svc,
+			r.Scheme,
+		)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	logf.FromContext(ctx).V(1).Info("reconciled service", "name", svc.Name, "op", op)
+
+	return nil
+}
+
+// reconcileRedisDeployment reconciles the single-replica Redis Deployment.
+func (r *RateLimitPolicyReconciler) reconcileRedisDeployment(ctx context.Context, p *rlv1alpha1.RateLimitPolicy, passwordHash string) error {
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: redisChildName(p), Namespace: p.Namespace},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
+
+		dep.Labels = mergeLabels(dep.Labels, redisChildLabels(p))
+		dep.Spec.Replicas = new(int32(redisReplicas))
+		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: redisChildLabels(p)}
+		dep.Spec.Template = corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: redisChildLabels(p),
+
+				// A new password changes this annotation, which rolls the pod.
+				Annotations: map[string]string{redisPasswordHashAnnotation: passwordHash},
+			},
+
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:            "redis",
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Image:           redisImage,
+					Ports:           []corev1.ContainerPort{{ContainerPort: 6379, Name: "redis"}},
+					Env: []corev1.EnvVar{
+						{
+							Name: "REDIS_PASSWORD",
+							ValueFrom: &corev1.EnvVarSource{
+								SecretKeyRef: &corev1.SecretKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{Name: redisChildName(p)},
+									Key:                  redisPasswordKey,
+								},
+							},
+						},
+					},
+					// Disable Redis RDB snapshots and AOF persistence, not required for a rate-limiter's ephemeral buckets.
+					Args: []string{"--requirepass", "$(REDIS_PASSWORD)", "--save", "", "--appendonly", "no"},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("redis")},
+						},
+						PeriodSeconds: 5,
+					},
+				}},
+			},
+		}
+
+		return controllerutil.SetControllerReference(
+			p,
+			dep,
+			r.Scheme,
+		)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	logf.FromContext(ctx).V(1).Info("reconciled deployment", "name", dep.Name, "op", op)
+
+	return nil
+}
+
+// redisChildName is the name shared by every resource provisioned for a policy.
+func redisChildName(p *rlv1alpha1.RateLimitPolicy) string {
+	return p.Name + "-redis"
+}
+
+// redisChildLabels is the label set every provisioned resource carries.
+func redisChildLabels(p *rlv1alpha1.RateLimitPolicy) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":      "redis",
+		"app.kubernetes.io/instance":  p.Name,
+		"app.kubernetes.io/component": "ratelimit-store",
+		ManagedByLabelKey:             ManagedByLabelValue,
+	}
+}
+
+// mergeLabels merges labels so a label another tool put on the object survives a reconcile.
+func mergeLabels(dst, src map[string]string) map[string]string {
+	if dst == nil {
+		dst = make(map[string]string, len(src))
+	}
+	maps.Copy(dst, src)
+	return dst
+}
+
+// updateStatus records the policy's current state, and writes only when something changed.
+func (r *RateLimitPolicyReconciler) updateStatus(ctx context.Context, rlp *rlv1alpha1.RateLimitPolicy, provisionErr error) error {
+	cond, err := r.readyCondition(ctx, rlp, provisionErr)
+	if err != nil {
+		return err
+	}
+	cond.ObservedGeneration = rlp.Generation
+
+	changed := rlp.Status.ObservedGeneration != rlp.Generation
+	rlp.Status.ObservedGeneration = rlp.Generation
+
+	if meta.SetStatusCondition(&rlp.Status.Conditions, cond) {
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+	return r.Status().Update(ctx, rlp)
+}
+
+// readyCondition describes the readiness of the provisioned ressources.
+func (r *RateLimitPolicyReconciler) readyCondition(ctx context.Context, p *rlv1alpha1.RateLimitPolicy, provisionErr error) (metav1.Condition, error) {
+	if provisionErr != nil {
+		return metav1.Condition{
+			Type:    ConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  ReasonProvisionFailed,
+			Message: provisionErr.Error(),
+		}, nil
+	}
+
+	if p.Spec.Store != rlv1alpha1.StoreRedis {
+		return metav1.Condition{
+			Type:    ConditionReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  ReasonNoProvisioningRequired,
+			Message: "memory store needs no provisioned resources",
+		}, nil
+	}
+
+	var dep appsv1.Deployment
+	key := client.ObjectKey{Name: redisChildName(p), Namespace: p.Namespace}
+
+	switch err := r.Get(ctx, key, &dep); {
+	case err == nil:
+	case apierrors.IsNotFound(err):
+		// Either it was only just created and the cache has not caught up or it was removed;
+		// from here both read the same and both resolve themselves.
+		return metav1.Condition{
+			Type:    ConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  ReasonRedisUnavailable,
+			Message: "redis deployment does not exist yet",
+		}, nil
+	default:
+		return metav1.Condition{}, fmt.Errorf("reading redis deployment: %w", err)
+	}
+
+	desired := int32(redisReplicas)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
+	}
+
+	cond := metav1.Condition{
+		Type:    ConditionReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  ReasonRedisUnavailable,
+		Message: fmt.Sprintf("%d/%d redis replicas available", dep.Status.AvailableReplicas, desired),
+	}
+	if dep.Status.AvailableReplicas >= desired {
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = ReasonRedisAvailable
+	}
+	return cond, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RateLimitPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rlv1alpha1.RateLimitPolicy{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.Secret{}).
 		Named("rl-ratelimitpolicy").
 		Complete(r)
 }

@@ -6,6 +6,8 @@ A kubernetes Operator that injects a rate-limiting sidecar in front of HTTP appl
 
 The operator runs a mutating admission webhook on Pods. When a pod opts in, the webhook injects [rate-limiter-proxy](https://github.com/h-hmz/rate-limiter-proxy) as a sidecar and redirects the pod's inbound traffic through it. The proxy is built on the [rate-limiter](https://github.com/h-hmz/rate-limiter) library. The app keeps its own port and its own configuration, and never learns that it is being proxied.
 
+Independently of the webhook, the operator reconciles `RateLimitPolicy` resources, provisioning a Redis store for each policy that asks for one: see [Rate limit policies](#rate-limit-policies).
+
 ### How it works
 
 Each injected pod gets two init containers. Its app containers are left untouched.
@@ -86,11 +88,69 @@ A probe on `/`, including an HTTP probe with no path, turns the limiter off for 
 
 TCP and gRPC probes on the app port cannot be bypassed. A TCP probe connects to the proxy and passes without testing the app, and a gRPC probe fails. Use HTTP probes on the app port, or probe a different port.
 
-### Current limits
+### Rate limit policies
 
-Every injected pod gets the same fixed limit: a token bucket of 2 requests per second with a burst of 2, counted per client IP. Counters live in each pod's memory, so every replica enforces the limit separately.
+A `RateLimitPolicy` describes a rate limiter configuration. The operator provisions the backing store the policy asks for and reports its readiness.
 
-Per-workload limits and a shared Redis store are planned. They will come from a `RateLimitPolicy` resource named by a pod annotation.
+```yaml
+apiVersion: rl.hhmz.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  name: web-limit
+spec:
+  algorithm: tokenbucket   # or fixedwindow
+  store: redis             # or memory
+  tokenBucket:
+    requests: 100          # tokens added per period
+    period: 1s             # optional, defaults to 1s
+    burst: 20              # bucket capacity
+```
+
+A `fixedwindow` policy carries the other parameter block:
+
+```yaml
+spec:
+  algorithm: fixedwindow
+  store: memory
+  fixedWindow:
+    requests: 100
+    window: 1m
+```
+
+| Field | Meaning |
+| --- | --- |
+| `algorithm` | `tokenbucket` or `fixedwindow`. Names which parameter block must be present; supplying the other one, both, or neither is rejected. |
+| `tokenBucket.requests`, `.period` | The sustained rate: `requests` tokens added per `period`. `period` defaults to `1s`, so one request per `10s` is a tenth of a request per second. |
+| `tokenBucket.burst` | Bucket capacity: the most requests servable back to back after an idle stretch. |
+| `fixedWindow.requests`, `.window` | Requests allowed per window. Every window starts empty, so a client may spend its whole allowance the moment one rolls over. |
+| `store` | `memory` gives every pod its own buckets, so the limit is enforced per replica. `redis` shares one set of buckets across every pod using the policy. Immutable once created. |
+| `key` | `ip` (default) buckets by the client address from `X-Forwarded-For`. `apikey` buckets by a header instead. |
+| `keyHeader` | The header carrying the API key, valid only with `key: apikey`. Defaults to `X-API-Key`. |
+| `failOpen` | `true` (default) turns a store outage into allows, `false` into `500`s. A store unreachable at startup is always a refusal to start. |
+
+Durations are Go durations, so `30s`, `1m`, `500ms` and `1h30m` all work.
+
+Policies are namespaced, and a policy belongs in the namespace of the pods that will use it.
+
+#### What a redis policy provisions
+
+For `store: redis` the operator creates three objects named `<policy>-redis` in the policy's namespace:
+
+- a single-replica **Deployment** running `redis:8.2.10-alpine3.22`, with `--requirepass` read from the Secret,
+- a ClusterIP **Service** on port 6379,
+- an immutable **Secret** holding a generated password.
+
+All three carry an owner reference to the policy, so deleting the policy deletes them. The Redis pod template carries a hash of the password, which is how rotation works: delete the Secret, and the next reconcile mints a new password and rolls the pod.
+
+`store: memory` provisions nothing.
+
+```sh
+$ kubectl get rlp
+NAME        ALGORITHM     STORE    READY   AGE
+web-limit   tokenbucket   redis    True    30s
+```
+
+`Ready` follows the Redis Deployment's available replica, and is `True` immediately for a memory policy, which has nothing to wait for.
 
 ### Requirements and caveats
 
@@ -99,14 +159,15 @@ Per-workload limits and a shared Redis store are planned. They will come from a 
 - **Clients are keyed by `X-Forwarded-For`.** Injected pods must sit behind an ingress that overwrites that header with the client's address. Requests without it get `400`. Do not expose injected pods directly.
 - **The app must serve plain HTTP on the app port.** The proxy forwards over HTTP to `127.0.0.1`, so an app serving TLS, or listening only on the pod IP, will not work.
 - **Admission fails open.** If the webhook is unreachable, pods are created without the sidecar instead of being rejected. The cluster keeps working, but that traffic is not limited.
+- **Provisioned Redis keeps nothing on disk.** It runs as one replica with snapshots and the append-only log disabled, and rolls with the `Recreate` strategy, so a Redis restart resets every bucket it held. That is a deliberate trade for rate-limiter state, not a durable datastore.
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
+- go version v1.26.0+.
 - docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- kubectl version v1.29+.
+- Access to a Kubernetes **v1.29+** cluster. The injected proxy is an init container with `restartPolicy: Always`, and the `SidecarContainers` feature gate that allows it has been on by default since v1.29.
 
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
@@ -134,14 +195,14 @@ make deploy IMG=<some-registry>/rate-limiter-operator:tag
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+**Create a RateLimitPolicy**
+You can apply the sample from `config/samples`:
 
 ```sh
 kubectl apply -k config/samples/
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+>**NOTE**: The sample is a memory-store policy, so it provisions nothing and goes `Ready` at once. Set `store: redis` to watch the Deployment, Service and Secret appear.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**
