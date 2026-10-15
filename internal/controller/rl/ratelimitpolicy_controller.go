@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"maps"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -35,9 +36,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 
 	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
 )
@@ -59,6 +62,9 @@ const (
 
 	// ConditionReady is the single condition type a policy carries.
 	ConditionReady = "Ready"
+
+	// FieldOwner names this operator in the managedFields when doing Server-Side Apply.
+	FieldOwner = "rate-limiter-operator"
 
 	// ReasonNoProvisioningRequired is a memory-store policy, which has nothing to build.
 	ReasonNoProvisioningRequired = "NoProvisioningRequired"
@@ -196,68 +202,65 @@ func (r *RateLimitPolicyReconciler) reconcileRedisService(ctx context.Context, p
 	return nil
 }
 
+// redisDeploymentAC describes the Redis Deployment as an apply configuration: only the fields this operator intends to own.
+// Everything else, including the API server's defaults, is left untouched instead of being wiped and re-defaulted on every pass.
+func redisDeploymentAC(p *rlv1alpha1.RateLimitPolicy, passwordHash string) *appsv1ac.DeploymentApplyConfiguration {
+	name := redisChildName(p)
+	labels := redisChildLabels(p)
+
+	container := corev1ac.Container().
+		WithName("redis").
+		WithImage(redisImage).
+		WithImagePullPolicy(corev1.PullIfNotPresent).
+		WithPorts(corev1ac.ContainerPort().
+			WithName("redis").
+			WithContainerPort(6379)).
+		WithEnv(corev1ac.EnvVar().
+			WithName("REDIS_PASSWORD").
+			WithValueFrom(corev1ac.EnvVarSource().
+				WithSecretKeyRef(corev1ac.SecretKeySelector().
+					WithName(name).
+					WithKey(redisPasswordKey)))).
+		// Disable RDB snapshots and AOF persistence: a rate limiter's buckets are ephemeral.
+		WithArgs("--requirepass", "$(REDIS_PASSWORD)", "--save", "", "--appendonly", "no").
+		WithReadinessProbe(corev1ac.Probe().
+			WithTCPSocket(corev1ac.TCPSocketAction().
+				WithPort(intstr.FromString("redis"))).
+			WithPeriodSeconds(5))
+
+	return appsv1ac.Deployment(name, p.Namespace).
+		WithLabels(labels).
+		WithOwnerReferences(metav1ac.OwnerReference().
+			WithAPIVersion(rlv1alpha1.SchemeGroupVersion.String()).
+			WithKind("RateLimitPolicy").
+			WithName(p.Name).
+			WithUID(p.UID).
+			WithController(true).
+			WithBlockOwnerDeletion(true)).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(redisReplicas).
+			// Recreate, not RollingUpdate: one replica with no persistence, so a second pod would briefly serve a different, empty set of buckets.
+			WithStrategy(appsv1ac.DeploymentStrategy().
+				WithType(appsv1.RecreateDeploymentStrategyType)).
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(labels)).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(labels).
+				// A new password changes this annotation, which rolls the pod.
+				WithAnnotations(map[string]string{redisPasswordHashAnnotation: passwordHash}).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(container))))
+}
+
 // reconcileRedisDeployment reconciles the single-replica Redis Deployment.
 func (r *RateLimitPolicyReconciler) reconcileRedisDeployment(ctx context.Context, p *rlv1alpha1.RateLimitPolicy, passwordHash string) error {
+	dep := redisDeploymentAC(p, passwordHash)
 
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: redisChildName(p), Namespace: p.Namespace},
+	if err := r.Apply(ctx, dep, client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
+		return fmt.Errorf("applying redis deployment: %w", err)
 	}
 
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
-
-		dep.Labels = mergeLabels(dep.Labels, redisChildLabels(p))
-		dep.Spec.Replicas = new(int32(redisReplicas))
-		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
-		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: redisChildLabels(p)}
-		dep.Spec.Template = corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: redisChildLabels(p),
-
-				// A new password changes this annotation, which rolls the pod.
-				Annotations: map[string]string{redisPasswordHashAnnotation: passwordHash},
-			},
-
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{
-					Name:            "redis",
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Image:           redisImage,
-					Ports:           []corev1.ContainerPort{{ContainerPort: 6379, Name: "redis"}},
-					Env: []corev1.EnvVar{
-						{
-							Name: "REDIS_PASSWORD",
-							ValueFrom: &corev1.EnvVarSource{
-								SecretKeyRef: &corev1.SecretKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{Name: redisChildName(p)},
-									Key:                  redisPasswordKey,
-								},
-							},
-						},
-					},
-					// Disable Redis RDB snapshots and AOF persistence, not required for a rate-limiter's ephemeral buckets.
-					Args: []string{"--requirepass", "$(REDIS_PASSWORD)", "--save", "", "--appendonly", "no"},
-					ReadinessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("redis")},
-						},
-						PeriodSeconds: 5,
-					},
-				}},
-			},
-		}
-
-		return controllerutil.SetControllerReference(
-			p,
-			dep,
-			r.Scheme,
-		)
-	})
-
-	if err != nil {
-		return err
-	}
-
-	logf.FromContext(ctx).V(1).Info("reconciled deployment", "name", dep.Name, "op", op)
+	logf.FromContext(ctx).V(1).Info("applied deployment", "name", redisChildName(p))
 
 	return nil
 }
