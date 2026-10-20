@@ -24,15 +24,18 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -104,6 +107,10 @@ func (r *RateLimitPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	provisionErr := r.provision(ctx, &rlp)
 
 	if err := r.updateStatus(ctx, &rlp, provisionErr); err != nil {
+		if apierrors.IsConflict(err) && provisionErr == nil {
+			logf.FromContext(ctx).V(1).Info("status write conflicted, requeueing")
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		return ctrl.Result{}, errors.Join(provisionErr, err)
 	}
 
@@ -369,7 +376,8 @@ func (r *RateLimitPolicyReconciler) readyCondition(ctx context.Context, p *rlv1a
 // SetupWithManager sets up the controller with the Manager.
 func (r *RateLimitPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&rlv1alpha1.RateLimitPolicy{}).
+		// Spec changes only: filter out status writes that do not bump metadata.Generation. Doesn't apply to children's statuses.
+		For(&rlv1alpha1.RateLimitPolicy{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
