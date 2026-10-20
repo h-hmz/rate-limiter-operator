@@ -296,6 +296,16 @@ func mergeLabels(dst, src map[string]string) map[string]string {
 	return dst
 }
 
+// redisStatus is the coordinates of the Redis provisioned for this policy. The webhook reads
+// them from status rather than recomputing the child-naming convention.
+func redisStatus(p *rlv1alpha1.RateLimitPolicy) *rlv1alpha1.RedisStatus {
+	return &rlv1alpha1.RedisStatus{
+		Address:            fmt.Sprintf("%s.%s.svc:6379", redisChildName(p), p.Namespace),
+		PasswordSecretName: redisChildName(p),
+		PasswordSecretKey:  redisPasswordKey,
+	}
+}
+
 // updateStatus records the policy's current state, and writes only when something changed.
 func (r *RateLimitPolicyReconciler) updateStatus(ctx context.Context, rlp *rlv1alpha1.RateLimitPolicy, provisionErr error) error {
 	cond, err := r.readyCondition(ctx, rlp, provisionErr)
@@ -309,6 +319,15 @@ func (r *RateLimitPolicyReconciler) updateStatus(ctx context.Context, rlp *rlv1a
 
 	if meta.SetStatusCondition(&rlp.Status.Conditions, cond) {
 		changed = true
+	}
+
+	// redisStatus is computed only after a successful provision. A later failure does not invalidate it.
+	if provisionErr == nil && rlp.Spec.Store == rlv1alpha1.StoreRedis {
+		desired := redisStatus(rlp)
+		if rlp.Status.Redis == nil || *rlp.Status.Redis != *desired {
+			rlp.Status.Redis = desired
+			changed = true
+		}
 	}
 
 	if !changed {

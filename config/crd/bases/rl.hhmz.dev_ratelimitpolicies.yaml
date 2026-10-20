@@ -234,6 +234,25 @@ spec:
                   was computed from.
                 format: int64
                 type: integer
+              redis:
+                description: redis describes the provisioned store, and is absent
+                  for a memory-store policy or before the first successful provision.
+                properties:
+                  address:
+                    description: address is the host:port the sidecar dials, as <child>.<namespace>.svc:6379.
+                    type: string
+                  passwordSecretKey:
+                    description: passwordSecretKey is the key within that Secret.
+                    type: string
+                  passwordSecretName:
+                    description: passwordSecretName is the Secret holding the generated
+                      password.
+                    type: string
+                required:
+                - address
+                - passwordSecretKey
+                - passwordSecretName
+                type: object
             type: object
         required:
         - spec

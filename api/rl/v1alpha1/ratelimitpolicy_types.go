@@ -139,6 +139,21 @@ type RateLimitPolicySpec struct {
 	FailOpen *bool `json:"failOpen,omitempty"`
 }
 
+// RedisStatus publishes the coordinates of the Redis this operator provisioned for the webhook to consume.
+type RedisStatus struct {
+	// address is the host:port the sidecar dials, as <child>.<namespace>.svc:6379.
+	// +required
+	Address string `json:"address"`
+
+	// passwordSecretName is the Secret holding the generated password.
+	// +required
+	PasswordSecretName string `json:"passwordSecretName"`
+
+	// passwordSecretKey is the key within that Secret.
+	// +required
+	PasswordSecretKey string `json:"passwordSecretKey"`
+}
+
 // RateLimitPolicyStatus defines the observed state of RateLimitPolicy.
 type RateLimitPolicyStatus struct {
 	// observedGeneration is the .metadata.generation this status was computed from.
@@ -152,6 +167,10 @@ type RateLimitPolicyStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// redis describes the provisioned store, and is absent for a memory-store policy or before the first successful provision.
+	// +optional
+	Redis *RedisStatus `json:"redis,omitempty"`
 }
 
 // +kubebuilder:object:root=true
