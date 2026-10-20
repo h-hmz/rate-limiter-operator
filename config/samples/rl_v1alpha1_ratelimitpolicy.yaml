@@ -7,7 +7,7 @@ metadata:
   name: ratelimitpolicy-sample
 spec:
   algorithm: tokenbucket
-  store: memory
+  store: redis
   tokenBucket:
     requests: 2
     burst: 2

@@ -1,0 +1,13 @@
+apiVersion: rl.hhmz.dev/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: rate-limiter-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: ratelimitpolicy-sample-fixedwindow
+spec:
+  algorithm: fixedwindow
+  store: memory
+  fixedWindow:
+    requests: 100
+    window: 1m
