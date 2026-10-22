@@ -26,11 +26,18 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	. "github.com/onsi/gomega"
+
+	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
 )
 
 var _ = Describe("Pod Webhook", func() {
 
 	var defaulter PodCustomDefaulter
+
+	// Assigned per spec, not at tree construction: k8sClient only exists once BeforeSuite ran.
+	BeforeEach(func() {
+		defaulter = PodCustomDefaulter{Reader: k8sClient}
+	})
 
 	DescribeTable("leaves pods that did not opt in untouched",
 		func(annotations map[string]string) {
@@ -60,6 +67,20 @@ var _ = Describe("Pod Webhook", func() {
 		Entry("the proxy metrics port", map[string]string{injectAnnotation: "true", appPortAnnotation: "15090"}),
 	)
 
+	DescribeTable("denies an opted-in pod whose policy cannot be resolved",
+		func(annotations map[string]string) {
+			pod := annotatedPod("unresolvable")
+			pod.Annotations = annotations
+
+			Expect(defaulter.Default(ctx, pod)).NotTo(Succeed())
+		},
+		Entry("missing", map[string]string{injectAnnotation: "true", appPortAnnotation: "80"}),
+		Entry("empty", map[string]string{
+			injectAnnotation: "true", appPortAnnotation: "80", policyAnnotation: ""}),
+		Entry("names a policy that does not exist", map[string]string{
+			injectAnnotation: "true", appPortAnnotation: "80", policyAnnotation: "absent"}),
+	)
+
 	It("appends rl-iptables-init, then rl-proxy, after the pod's own init containers", func() {
 		pod := annotatedPod("injected")
 		pod.Spec.InitContainers = []corev1.Container{{Name: "migrate", Image: "busybox:1.37"}}
@@ -74,6 +95,78 @@ var _ = Describe("Pod Webhook", func() {
 		Expect(proxy.RestartPolicy).To(HaveValue(Equal(corev1.ContainerRestartPolicyAlways)))
 		Expect(proxy.Env).To(ContainElement(corev1.EnvVar{Name: "RL_APP_PORT", Value: "80"}))
 
+	})
+
+	It("carries the policy's settings into the sidecar environment", func() {
+		pod := annotatedPod("env")
+
+		Expect(defaulter.Default(ctx, pod)).To(Succeed())
+
+		proxy := pod.Spec.InitContainers[1]
+		Expect(proxy.Env).To(ContainElements(
+			corev1.EnvVar{Name: "RL_ALGORITHM", Value: "tokenbucket"},
+			corev1.EnvVar{Name: "RL_STORE", Value: "memory"},
+			corev1.EnvVar{Name: "RL_RATE", Value: "2"},
+			corev1.EnvVar{Name: "RL_BURST", Value: "2"},
+			corev1.EnvVar{Name: "RL_KEY", Value: "ip"},
+			corev1.EnvVar{Name: "RL_FAIL_OPEN", Value: "true"},
+		))
+	})
+
+	Context("with a redis-store policy", func() {
+		var policy *rlv1alpha1.RateLimitPolicy
+
+		BeforeEach(func() {
+			policy = &rlv1alpha1.RateLimitPolicy{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "redis-", Namespace: "default"},
+				Spec: rlv1alpha1.RateLimitPolicySpec{
+					Algorithm:   rlv1alpha1.AlgorithmTokenBucket,
+					Store:       rlv1alpha1.StoreRedis,
+					TokenBucket: &rlv1alpha1.TokenBucketSpec{Requests: 2, Burst: 2},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, policy)).To(Succeed())
+			})
+		})
+
+		It("denies the pod until the operator publishes the coordinates", func() {
+			pod := annotatedPod("redis-pending")
+			pod.Annotations[policyAnnotation] = policy.Name
+
+			Expect(defaulter.Default(ctx, pod)).NotTo(Succeed())
+			Expect(pod.Spec.InitContainers).To(BeEmpty())
+		})
+
+		It("points the sidecar at the published address and password Secret", func() {
+			policy.Status.Redis = &rlv1alpha1.RedisStatus{
+				Address:            policy.Name + "-redis.default.svc:6379",
+				PasswordSecretName: policy.Name + "-redis",
+				PasswordSecretKey:  "redis-password",
+			}
+			Expect(k8sClient.Status().Update(ctx, policy)).To(Succeed())
+
+			pod := annotatedPod("redis-ready")
+			pod.Annotations[policyAnnotation] = policy.Name
+
+			Expect(defaulter.Default(ctx, pod)).To(Succeed())
+
+			proxy := pod.Spec.InitContainers[1]
+			Expect(proxy.Env).To(ContainElements(
+				corev1.EnvVar{Name: "RL_STORE", Value: "redis"},
+				corev1.EnvVar{Name: "RL_REDIS_ADDR", Value: policy.Status.Redis.Address},
+			))
+			Expect(proxy.Env).To(ContainElement(corev1.EnvVar{
+				Name: "RL_REDIS_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: policy.Status.Redis.PasswordSecretName},
+						Key:                  "redis-password",
+					},
+				},
+			}))
+		})
 	})
 
 	It("does not inject twice", func() {
@@ -136,8 +229,9 @@ var _ = Describe("Pod Webhook", func() {
 	)
 })
 
-// annotatedPod returns a pod in "default" that opts in to injection with app
-// port 80. Its only container, "app", declares 80 as a port named "http".
+// annotatedPod returns a pod in "default" that :
+// - opts in to injection with app port 80 ("http" named port)
+// - points at policy `testPolicyName`
 func annotatedPod(name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -146,6 +240,7 @@ func annotatedPod(name string) *corev1.Pod {
 			Annotations: map[string]string{
 				injectAnnotation:  "true",
 				appPortAnnotation: "80",
+				policyAnnotation:  testPolicyName,
 			},
 		},
 		Spec: corev1.PodSpec{

@@ -30,6 +30,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -39,8 +40,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
+
+// testPolicyName is the RateLimitPolicy used for tests.
+const testPolicyName = "webhook-test-policy"
 
 // These tests use Ginkgo (BDD-style Go testing framework). Refer to
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
@@ -68,6 +74,9 @@ var _ = BeforeSuite(func() {
 	err = corev1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = rlv1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
@@ -93,6 +102,16 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	By("creating the policy referenced by pods in tests")
+	Expect(k8sClient.Create(ctx, &rlv1alpha1.RateLimitPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: testPolicyName, Namespace: "default"},
+		Spec: rlv1alpha1.RateLimitPolicySpec{
+			Algorithm:   rlv1alpha1.AlgorithmTokenBucket,
+			Store:       rlv1alpha1.StoreMemory,
+			TokenBucket: &rlv1alpha1.TokenBucketSpec{Requests: 2, Burst: 2},
+		},
+	})).To(Succeed())
 
 	// start webhook server using Manager.
 	webhookInstallOptions := &testEnv.WebhookInstallOptions

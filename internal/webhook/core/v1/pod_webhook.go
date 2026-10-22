@@ -26,10 +26,14 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	rlv1alpha1 "github.com/h-hmz/rate-limiter-operator/api/rl/v1alpha1"
 )
 
 const (
@@ -38,6 +42,9 @@ const (
 
 	// The port the app listens on, and so the port PREROUTING captures.
 	appPortAnnotation = "rl.hhmz.dev/app-port"
+
+	// The RateLimitPolicy the sidecar is configured from, read from the pod's own namespace.
+	policyAnnotation = "rl.hhmz.dev/policy"
 
 	initContainerName = "rl-iptables-init"
 	sidecarName       = "rl-proxy"
@@ -52,12 +59,6 @@ const (
 	proxyUserID = 65532
 )
 
-const (
-	Algorithm = "tokenbucket"
-	Rate      = "2"
-	Burst     = "2"
-)
-
 // nolint:unused
 // log is for logging in this package.
 var podlog = logf.Log.WithName("pod-resource")
@@ -65,7 +66,7 @@ var podlog = logf.Log.WithName("pod-resource")
 // SetupPodWebhookWithManager registers the webhook for Pod in the manager.
 func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
-		WithDefaulter(&PodCustomDefaulter{}).
+		WithDefaulter(&PodCustomDefaulter{Reader: mgr.GetAPIReader()}).
 		WithDefaulterCustomPath("/mutate-core-v1-pod").
 		Complete()
 }
@@ -74,10 +75,13 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 
 // PodCustomDefaulter struct is responsible for setting default values on the custom resource of the
 // Kind Pod when those are created or updated.
-type PodCustomDefaulter struct{}
+type PodCustomDefaulter struct {
+	// Reader for fetching the RateLimitPolicy named by the pod.
+	Reader client.Reader
+}
 
 // Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind Pod.
-func (d *PodCustomDefaulter) Default(_ context.Context, pod *corev1.Pod) error {
+func (d *PodCustomDefaulter) Default(ctx context.Context, pod *corev1.Pod) error {
 	log := podlog.WithValues("namespace", pod.Namespace, "pod", podDisplayName(pod))
 
 	// Skip pods that are not targeted by this webhook.
@@ -97,18 +101,59 @@ func (d *PodCustomDefaulter) Default(_ context.Context, pod *corev1.Pod) error {
 		return err
 	}
 
+	policy, err := d.resolvePolicy(ctx, pod)
+	if err != nil {
+		return err
+	}
+
 	// Collect the probe paths that must skip the limiter.
 	bypassPaths := probeBypassPaths(pod, appPort, log)
 
 	// Mutate.
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers,
 		iptablesInitContainer(appPort), // Order matters: the nat rule must exist before anything listens.
-		proxySidecar(appPort, bypassPaths),
+		proxySidecar(appPort, policy, bypassPaths),
 	)
 
-	log.Info("injected sidecar", "appPort", appPort, "bypassPaths", bypassPaths)
+	log.Info("injected sidecar",
+		"appPort", appPort,
+		"policy", policy.Name,
+		"algorithm", policy.Spec.Algorithm,
+		"store", policy.Spec.Store,
+		"bypassPaths", bypassPaths,
+	)
 
 	return nil
+}
+
+// resolvePolicy reads the RateLimitPolicy named by the pod's policy annotation.
+// A missing annotation, an unknown policy, or a redis-store policy whose coordinates are not published yet all deny the pod.
+func (d *PodCustomDefaulter) resolvePolicy(ctx context.Context, pod *corev1.Pod) (*rlv1alpha1.RateLimitPolicy, error) {
+	name := pod.Annotations[policyAnnotation]
+	if name == "" {
+		return nil, fmt.Errorf("required annotation %q is missing", policyAnnotation)
+	}
+
+	var policy rlv1alpha1.RateLimitPolicy
+	key := client.ObjectKey{Name: name, Namespace: pod.Namespace}
+
+	if err := d.Reader.Get(ctx, key, &policy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf(
+				"annotation %q names RateLimitPolicy %q, which does not exist in namespace %q",
+				policyAnnotation,
+				name,
+				pod.Namespace,
+			)
+		}
+		return nil, fmt.Errorf("reading RateLimitPolicy %q: %w", name, err)
+	}
+
+	if policy.Spec.Store == rlv1alpha1.StoreRedis && policy.Status.Redis == nil {
+		return nil, fmt.Errorf("RateLimitPolicy %q uses the redis store but has not published status.redis yet", name)
+	}
+
+	return &policy, nil
 }
 
 // resolveAppPort reads the app port from the pod's annotations.
@@ -336,17 +381,60 @@ func iptablesInitContainer(appPort int32) corev1.Container {
 
 // proxySidecar builds the native sidecar: an init container whose restartPolicy
 // is Always, so the kubelet starts it before the app and stops it after.
-func proxySidecar(appPort int32, bypassPaths []string) corev1.Container {
+func proxySidecar(appPort int32, policy *rlv1alpha1.RateLimitPolicy, bypassPaths []string) corev1.Container {
 	always := corev1.ContainerRestartPolicyAlways
 
 	env := []corev1.EnvVar{
 		{Name: "RL_APP_PORT", Value: strconv.Itoa(int(appPort))},
 		{Name: "RL_LISTEN_PORT", Value: strconv.Itoa(proxyListenPort)},
 		{Name: "RL_METRICS_PORT", Value: strconv.Itoa(proxyMetricsPort)},
-		{Name: "RL_ALGORITHM", Value: Algorithm},
-		{Name: "RL_RATE", Value: Rate},
-		{Name: "RL_BURST", Value: Burst},
+		{Name: "RL_ALGORITHM", Value: string(policy.Spec.Algorithm)},
+		{Name: "RL_STORE", Value: string(policy.Spec.Store)},
 	}
+
+	if policy.Spec.Key != "" {
+		env = append(env, corev1.EnvVar{Name: "RL_KEY", Value: string(policy.Spec.Key)})
+	}
+	if policy.Spec.KeyHeader != "" {
+		env = append(env, corev1.EnvVar{Name: "RL_KEY_HEADER", Value: policy.Spec.KeyHeader})
+	}
+	if policy.Spec.FailOpen != nil {
+		env = append(env, corev1.EnvVar{
+			Name:  "RL_FAIL_OPEN",
+			Value: strconv.FormatBool(*policy.Spec.FailOpen),
+		})
+	}
+
+	switch policy.Spec.Algorithm {
+	case rlv1alpha1.AlgorithmFixedWindow:
+		env = append(env,
+			corev1.EnvVar{Name: "RL_RATE", Value: strconv.Itoa(int(policy.Spec.FixedWindow.Requests))},
+			corev1.EnvVar{Name: "RL_WINDOW", Value: policy.Spec.FixedWindow.Window.Duration.String()},
+		)
+	case rlv1alpha1.AlgorithmTokenBucket:
+		requests := float64(policy.Spec.TokenBucket.Requests)
+		period := policy.Spec.TokenBucket.Period
+		rate := strconv.FormatFloat(requests/period.Duration.Seconds(), 'f', -1, 64)
+		env = append(env,
+			corev1.EnvVar{Name: "RL_RATE", Value: rate},
+			corev1.EnvVar{Name: "RL_BURST", Value: strconv.Itoa(int(policy.Spec.TokenBucket.Burst))},
+		)
+	}
+
+	if policy.Spec.Store == rlv1alpha1.StoreRedis {
+		env = append(env,
+			corev1.EnvVar{Name: "RL_REDIS_ADDR", Value: policy.Status.Redis.Address},
+			corev1.EnvVar{Name: "RL_REDIS_PASSWORD", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: policy.Status.Redis.PasswordSecretName,
+					},
+					Key: policy.Status.Redis.PasswordSecretKey,
+				}},
+			},
+		)
+	}
+
 	if len(bypassPaths) > 0 {
 		env = append(env, corev1.EnvVar{
 			Name:  "RL_BYPASS_PATHS",
