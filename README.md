@@ -36,7 +36,7 @@ The injected images are `ghcr.io/h-hmz/rate-limiter-proxy:0.1.0` and `registry.k
 
 ### Usage
 
-Annotate the pod template:
+Annotate the pod template, naming a [policy](#rate-limit-policies) that exists in the pod's namespace:
 
 ```yaml
 apiVersion: apps/v1
@@ -54,6 +54,7 @@ spec:
       annotations:
         rl.hhmz.dev/inject: "true"
         rl.hhmz.dev/app-port: "8080"
+        rl.hhmz.dev/policy: web-limit
     spec:
       containers:
         - name: web
@@ -71,6 +72,7 @@ spec:
 | --- | --- |
 | `rl.hhmz.dev/inject` | Must be exactly `"true"`. Any other value, or no annotation, leaves the pod alone. |
 | `rl.hhmz.dev/app-port` | The port the app listens on. Required. A missing or invalid value, or one equal to 15001 or 15090, makes the API server reject the pod. |
+| `rl.hhmz.dev/policy` | The `RateLimitPolicy` in the pod's own namespace that configures the sidecar. Required. A missing annotation, a policy that does not exist, or a `redis` policy whose store is not provisioned yet all make the API server reject the pod. |
 
 Injection happens only when a pod is created, so restart existing workloads to pick up the sidecar:
 
@@ -150,7 +152,7 @@ NAME        ALGORITHM     STORE    READY   AGE
 web-limit   tokenbucket   redis    True    30s
 ```
 
-`Ready` follows the Redis Deployment's available replica, and is `True` immediately for a memory policy, which has nothing to wait for.
+`Ready` follows the Redis Deployment's available replica, and is `True` immediately for a memory policy, which has nothing to wait for. A `redis` policy also publishes the coordinates it provisioned under `status.redis`, which is what the webhook reads when it configures a sidecar.
 
 ### Requirements and caveats
 
@@ -160,112 +162,65 @@ web-limit   tokenbucket   redis    True    30s
 - **The app must serve plain HTTP on the app port.** The proxy forwards over HTTP to `127.0.0.1`, so an app serving TLS, or listening only on the pod IP, will not work.
 - **Admission fails open.** If the webhook is unreachable, pods are created without the sidecar instead of being rejected. The cluster keeps working, but that traffic is not limited.
 - **Provisioned Redis keeps nothing on disk.** It runs as one replica with snapshots and the append-only log disabled, and rolls with the `Recreate` strategy, so a Redis restart resets every bucket it held. That is a deliberate trade for rate-limiter state, not a durable datastore.
+- **Editing a policy does not reach running pods.** The sidecar's configuration is written into the pod at admission, so a changed `requests`, `burst`, `window`, `key` or `failOpen` applies to new pods only.
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.26.0+.
-- docker version 17.03+.
-- kubectl version v1.29+.
-- Access to a Kubernetes **v1.29+** cluster. The injected proxy is an init container with `restartPolicy: Always`, and the `SidecarContainers` feature gate that allows it has been on by default since v1.29.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- Go v1.26.0+, to build from source.
+- A container engine: Docker, or Podman with `CONTAINER_TOOL=podman` on the `make` targets below.
+- kubectl v1.29+.
+- A Kubernetes **v1.29+** cluster. The injected proxy is an init container with `restartPolicy: Always`, and the `SidecarContainers` feature gate that allows it has been on by default since v1.29.
+- **cert-manager** in the cluster, as noted above.
+
+### Deploy
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/rate-limiter-operator:tag
+make docker-build docker-push IMG=<registry>/rate-limiter-operator:tag
+make deploy IMG=<registry>/rate-limiter-operator:tag
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+`make deploy` renders `config/default`, which includes the CRDs, so it installs them as well. `make install` installs only the CRDs, without the manager.
 
-**Install the CRDs into the cluster:**
+Example on k3s with podman:
 
 ```sh
-make install
+make docker-build CONTAINER_TOOL=podman IMG=localhost/rate-limiter-operator:dev
+podman save localhost/rate-limiter-operator:dev | sudo k3s ctr images import -
+make deploy IMG=localhost/rate-limiter-operator:dev
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### Example
 
 ```sh
-make deploy IMG=<some-registry>/rate-limiter-operator:tag
+kubectl apply -k config/samples/                        # a fixedwindow/memory and a tokenbucket/redis policy
+kubectl get rlp                                         # READY goes True once Redis reports available
+kubectl apply -f config/samples/sample_app_redis.yaml   # nginx, two replicas, behind the redis policy
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create a RateLimitPolicy**
-You can apply the sample from `config/samples`:
+Because the two replicas share one Redis bucket, two requests to one of them exhaust it and the next request to the *other* replica is already limited:
 
 ```sh
-kubectl apply -k config/samples/
+IPS=($(kubectl get pods -l app=sample-app-redis -o jsonpath='{.items[*].status.podIP}'))
+for i in 1 2; do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.7" http://${IPS[0]}/; done
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Forwarded-For: 203.0.113.7" http://${IPS[1]}/
 ```
 
->**NOTE**: The sample is a memory-store policy, so it provisions nothing and goes `Ready` at once. Set `store: redis` to watch the Deployment, Service and Secret appear.
+`200 200` then `429`. With `store: memory` the second replica answers `200`, because it keeps its own buckets.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### Uninstall
 
 ```sh
+kubectl delete -f config/samples/sample_app_redis.yaml
 kubectl delete -k config/samples/
+make undeploy    # the manager, its RBAC and the webhook configuration
+make uninstall   # the CRDs, and with them every policy and the Redis each one provisioned
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Distribution
 
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/rate-limiter-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/rate-limiter-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+`make build-installer IMG=<registry>/rate-limiter-operator:tag` renders every manifest into `dist/install.yaml`, a single file that installs the operator with one `kubectl apply -f` and no clone. It is not committed here, so build it from the tag you want to ship.
 
 ## License
 
@@ -282,4 +237,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
