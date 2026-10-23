@@ -9,5 +9,5 @@ spec:
   algorithm: fixedwindow
   store: memory
   fixedWindow:
-    requests: 100
-    window: 1m
+    requests: 2
+    window: 5s

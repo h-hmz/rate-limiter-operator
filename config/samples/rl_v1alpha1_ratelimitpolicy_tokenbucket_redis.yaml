@@ -4,10 +4,11 @@ metadata:
   labels:
     app.kubernetes.io/name: rate-limiter-operator
     app.kubernetes.io/managed-by: kustomize
-  name: ratelimitpolicy-sample
+  name: ratelimitpolicy-sample-tokenbucket-redis
 spec:
   algorithm: tokenbucket
   store: redis
   tokenBucket:
     requests: 2
     burst: 2
+    period: 5s

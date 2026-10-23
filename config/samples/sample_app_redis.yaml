@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-app-redis-conf
+data:
+  default.conf: |
+    server {
+        listen 80;
+        location = /healthz { access_log off; return 200 "ok\n"; }
+        location / { root /usr/share/nginx/html; index index.html; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app-redis
+  labels:
+    app.kubernetes.io/name: rate-limiter-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: sample-app-redis}
+  template:
+    metadata:
+      labels: {app: sample-app-redis}
+      annotations:
+        rl.hhmz.dev/inject: "true"
+        rl.hhmz.dev/app-port: "80"
+        rl.hhmz.dev/policy: ratelimitpolicy-sample-tokenbucket-redis
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.29-alpine
+        ports:
+        - {name: http, containerPort: 80}
+        readinessProbe:
+          httpGet: {path: /healthz, port: 80}
+          periodSeconds: 5
+        volumeMounts:
+        - {name: conf, mountPath: /etc/nginx/conf.d/default.conf, subPath: default.conf, readOnly: true}
+      volumes:
+      - name: conf
+        configMap: {name: sample-app-redis-conf}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-redis
+spec:
+  selector: {app: sample-app-redis}
+  ports:
+  - {port: 80, targetPort: 80}
