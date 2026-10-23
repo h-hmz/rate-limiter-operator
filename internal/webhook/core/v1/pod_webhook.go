@@ -409,12 +409,15 @@ func proxySidecar(appPort int32, policy *rlv1alpha1.RateLimitPolicy, bypassPaths
 	case rlv1alpha1.AlgorithmFixedWindow:
 		env = append(env,
 			corev1.EnvVar{Name: "RL_RATE", Value: strconv.Itoa(int(policy.Spec.FixedWindow.Requests))},
+			// .Duration is required: metav1.Duration's own String() is the protobuf one,
+			// which renders "&Duration{Duration:1m30s,}".
+			// see: https://github.com/kubernetes/apimachinery/blob/v0.36.0/pkg/apis/meta/v1/generated.pb.go
 			corev1.EnvVar{Name: "RL_WINDOW", Value: policy.Spec.FixedWindow.Window.Duration.String()},
 		)
 	case rlv1alpha1.AlgorithmTokenBucket:
 		requests := float64(policy.Spec.TokenBucket.Requests)
 		period := policy.Spec.TokenBucket.Period
-		rate := strconv.FormatFloat(requests/period.Duration.Seconds(), 'f', -1, 64)
+		rate := strconv.FormatFloat(requests/period.Seconds(), 'f', -1, 64)
 		env = append(env,
 			corev1.EnvVar{Name: "RL_RATE", Value: rate},
 			corev1.EnvVar{Name: "RL_BURST", Value: strconv.Itoa(int(policy.Spec.TokenBucket.Burst))},
